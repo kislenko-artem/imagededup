@@ -1,6 +1,7 @@
 from pathlib import Path, PurePath
+import pickle
 import sys
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Union, Any
 import warnings
 
 from multiprocessing import cpu_count
@@ -40,6 +41,8 @@ class CNN:
     directory that contains the images that need to be deduplicated. 'find_duplicates' and 'find_duplicates_to_remove'
     methods are provided to accomplish these tasks.
     """
+
+    DUMP_NAME = "encoding_map"
 
     def __init__(
         self,
@@ -115,6 +118,68 @@ class CNN:
             unpacked_img_features_tensor = img_features_tensor.detach().numpy()
 
         return unpacked_img_features_tensor
+
+    def _save_dump(self, dump_path: Path, iteration_num: int, data: Any):
+        with open(dump_path / Path(f'{CNN.DUMP_NAME}_{iteration_num}.pickle'), 'wb') as f:
+            pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    def _load_dump(self, dump_path: Path, iteration_num: int) -> Any:
+        with open(dump_path / Path(f'{CNN.DUMP_NAME}_{iteration_num}.pickle'), 'rb') as f:
+            return pickle.load(f)
+
+    def _get_cnn_features_batch_with_dump(
+        self,
+        image_dir: PurePath,
+        recursive: Optional[bool] = False,
+        num_workers: int = 0,
+        dump_path: Optional[Path] = None
+    ) -> None:
+        """
+        Generate CNN encodings for all images in a given directory of images.
+        Args:
+            image_dir: Path to the image directory.
+            recursive: Optional, find images recursively in a nested image directory structure.
+            num_workers: Optional, number of cpu cores to use for multiprocessing encoding generation (supported only on linux platform), set to 0 by default. 0 disables multiprocessing.
+            dump_path: Optional, path to file, where dictionary will be save, for reducing RAM consumption
+
+        Returns:
+           None
+        """
+        self.logger.info("Start: Image encoding generation")
+        self.dataloader = img_dataloader(
+            image_dir=image_dir,
+            batch_size=self.batch_size,
+            basenet_preprocess=self.apply_preprocess,
+            recursive=recursive,
+            num_workers=num_workers,
+        )
+
+        feat_arr, all_filenames = [], []
+
+        with torch.no_grad():
+            for i, (ims, filenames, _bad_images) in enumerate(self.dataloader):
+                arr = self.model(ims.to(self.device))
+                feat_arr.extend(arr)
+                all_filenames.extend(filenames)
+
+                feat_vec = torch.stack(feat_arr).squeeze()
+                feat_vec = (
+                    feat_vec.detach().numpy()
+                    if self.device.type == "cpu"
+                    else feat_vec.detach().cpu().numpy()
+                )
+                valid_image_files = [filename for filename in all_filenames if filename]
+                self.logger.info("End: Image encoding generation")
+
+                filenames = generate_relative_names(image_dir, valid_image_files)
+                if (
+                    len(feat_vec.shape) == 1
+                ):  # can happen when encode_images is called on a directory containing a single image
+                    encoding_map = {filenames[0]: feat_vec}
+                else:
+                    encoding_map = {j: feat_vec[i, :] for i, j in enumerate(filenames)}
+                self._save_dump(dump_path, i, encoding_map)
+        return None
 
     def _get_cnn_features_batch(
         self,
@@ -233,6 +298,7 @@ class CNN:
         image_dir: Union[PurePath, str],
         recursive: Optional[bool] = False,
         num_enc_workers: int = 0,
+        dump_path: Optional[Path] = None
     ) -> Dict:
         """Generate CNN encodings for all images in a given directory of images. Test.
 
@@ -240,6 +306,7 @@ class CNN:
             image_dir: Path to the image directory.
             recursive: Optional, find images recursively in a nested image directory structure, set to False by default.
             num_enc_workers: Optional, number of cpu cores to use for multiprocessing encoding generation (supported only on linux platform), set to 0 by default. 0 disables multiprocessing.
+            dump_path: Optional, path to file, where dictionary will be save, for reducing RAM consumption
 
         Returns:
             dictionary: Contains a mapping of filenames and corresponding numpy array of CNN encodings.
@@ -261,7 +328,10 @@ class CNN:
             self.logger.info(
                 f"Setting num_enc_workers to 0, CNN encoding generation parallelization support available on linux platform .."
             )
-
+        if dump_path is not None:
+            return self._get_cnn_features_batch_with_dump(
+                image_dir=image_dir, recursive=recursive, num_workers=num_enc_workers, dump_path=dump_path
+            )
         return self._get_cnn_features_batch(
             image_dir=image_dir, recursive=recursive, num_workers=num_enc_workers
         )
@@ -283,7 +353,81 @@ class CNN:
             raise TypeError("Threshold must be a float between -1.0 and 1.0")
         if thresh < -1.0 or thresh > 1.0:
             raise ValueError("Threshold must be a float between -1.0 and 1.0")
+        
+    def _find_duplicates_from_dump(
+        self,
+        min_similarity_threshold: float,
+        scores: bool,
+        dump_path: Path,
+        num_sim_workers: int = cpu_count(),
+        outfile: Optional[str] = None,
+    ) -> Dict:
+        """
+        Take in dictionary {filename: encoded image}, detects duplicates above the given cosine similarity threshold
+        and returns a dictionary containing key as filename and value as a list of duplicate filenames. Optionally,
+        the cosine distances could be returned instead of just duplicate filenames for each query file.
 
+        Args:
+            encoding_map: Dictionary with keys as file names and values as encoded images.
+            min_similarity_threshold: Cosine similarity above which retrieved duplicates are valid.
+            scores: Boolean indicating whether similarity scores are to be returned along with retrieved duplicates.
+            num_sim_workers: Optional, number of cpu cores to use for multiprocessing similarity computation, set to number of CPUs in the system by default. 0 disables multiprocessing.
+            dump_path: Optional, path to file, where dump of dictionary was saved
+        Returns:
+            if scores is True, then a dictionary of the form {'image1.jpg': [('image1_duplicate1.jpg',
+            score), ('image1_duplicate2.jpg', score)], 'image2.jpg': [] ..}
+            if scores is False, then a dictionary of the form {'image1.jpg': ['image1_duplicate1.jpg',
+            'image1_duplicate2.jpg'], 'image2.jpg':['image1_duplicate1.jpg',..], ..}
+        """
+
+        results = {}
+        dump_files = dump_path.glob(f"{CNN.DUMP_NAME}_*")
+        for i, _file_path_acceptor in enumerate(dump_files):
+            for k, _file_path_donor in enumerate(dump_files):
+                if k <= i:
+                    continue
+                encoding_map: Dict[str, list] = self._load_dump(dump_path, i)
+                encoding_map_donor: Dict[str, list] = self._load_dump(dump_path, k)
+                encoding_map.update(encoding_map_donor)
+                print(encoding_map)
+
+                # get all image ids
+                # we rely on dictionaries preserving insertion order in Python >=3.6
+                image_ids = np.array([*encoding_map.keys()])
+
+                # put image encodings into feature matrix
+                features = np.array([*encoding_map.values()])
+
+                self.logger.info("Start: Calculating cosine similarities...")
+
+                self.cosine_scores = get_cosine_similarity(
+                    features, bool(self.verbose), num_workers=num_sim_workers
+                )
+
+                np.fill_diagonal(
+                    self.cosine_scores, 2.0
+                )  # allows to filter diagonal in results, 2 is a placeholder value
+
+                self.logger.info("End: Calculating cosine similarities.")
+
+                for i, j in enumerate(self.cosine_scores):
+                    duplicates_bool = (j >= min_similarity_threshold) & (j < 2)
+
+                    if scores:
+                        tmp = np.array([*zip(image_ids, j)], dtype=object)
+                        duplicates = list(map(tuple, tmp[duplicates_bool]))
+
+                    else:
+                        duplicates = list(image_ids[duplicates_bool])
+
+                    results[image_ids[i]] = duplicates
+
+        if outfile and scores:
+            save_json(results=results, filename=outfile, float_scores=True)
+        elif outfile:
+            save_json(results=results, filename=outfile)
+        return results
+    
     def _find_duplicates_dict(
         self,
         encoding_map: Dict[str, list],
@@ -401,6 +545,7 @@ class CNN:
         recursive: Optional[bool] = False,
         num_enc_workers: int = 0,
         num_sim_workers: int = cpu_count(),
+        dump_path: Optional[Path] = None
     ) -> Dict:
         """
         Find duplicates for each file. Take in path of the directory or encoding dictionary in which duplicates are to
@@ -420,7 +565,7 @@ class CNN:
             recursive: Optional, find images recursively in a nested image directory structure, set to False by default.
             num_enc_workers: Optional, number of cpu cores to use for multiprocessing encoding generation (supported only on linux platform), set to 0 by default. 0 disables multiprocessing.
             num_sim_workers: Optional, number of cpu cores to use for multiprocessing similarity computation, set to number of CPUs in the system by default. 0 disables multiprocessing.
-
+            dump_path: Optional, path to file, where dump of dictionary was saved, in this case encoding_map will be ignored
         Returns:
             dictionary: if scores is True, then a dictionary of the form {'image1.jpg': [('image1_duplicate1.jpg',
                         score), ('image1_duplicate2.jpg', score)], 'image2.jpg': [] ..}. if scores is False, then a
@@ -444,8 +589,18 @@ class CNN:
         """
         self._check_threshold_bounds(min_similarity_threshold)
 
+        if dump_path:
+            return self._find_duplicates_from_dump(
+                min_similarity_threshold=min_similarity_threshold,
+                scores=scores,
+                dump_path=dump_path,
+                num_sim_workers=num_sim_workers,
+                outfile=outfile,
+            )
+
+
         if image_dir:
-            result = self._find_duplicates_dir(
+            return self._find_duplicates_dir(
                 image_dir=image_dir,
                 min_similarity_threshold=min_similarity_threshold,
                 scores=scores,
@@ -464,7 +619,7 @@ class CNN:
                 "Parameter num_enc_workers has no effect since encodings are already provided",
                 RuntimeWarning,
             )
-            result = self._find_duplicates_dict(
+            return self._find_duplicates_dict(
                 encoding_map=encoding_map,
                 min_similarity_threshold=min_similarity_threshold,
                 scores=scores,
@@ -472,10 +627,8 @@ class CNN:
                 num_sim_workers=num_sim_workers,
             )
 
-        else:
-            raise ValueError("Provide either an image directory or encodings!")
+        raise ValueError("Provide either an image directory or encodings!")
 
-        return result
 
     def find_duplicates_to_remove(
         self,

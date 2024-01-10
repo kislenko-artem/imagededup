@@ -8,7 +8,7 @@ from tqdm import tqdm
 
 from imagededup.handlers.search.bktree import BKTree
 from imagededup.handlers.search.brute_force import BruteForce
-from imagededup.handlers.search.brute_force_cython import BruteForceCython
+#from imagededup.handlers.search.brute_force_cython import BruteForceCython
 from imagededup.utils.general_utils import parallelise
 from imagededup.utils.logger import return_logger
 
