@@ -154,10 +154,10 @@ class CNN:
             num_workers=num_workers,
         )
 
-        feat_arr, all_filenames = [], []
 
         with torch.no_grad():
             for i, (ims, filenames, _bad_images) in enumerate(self.dataloader):
+                feat_arr, all_filenames = [], []
                 arr = self.model(ims.to(self.device))
                 feat_arr.extend(arr)
                 all_filenames.extend(filenames)
@@ -169,7 +169,7 @@ class CNN:
                     else feat_vec.detach().cpu().numpy()
                 )
                 valid_image_files = [filename for filename in all_filenames if filename]
-                self.logger.info("End: Image encoding generation")
+                
 
                 filenames = generate_relative_names(image_dir, valid_image_files)
                 if (
@@ -179,6 +179,7 @@ class CNN:
                 else:
                     encoding_map = {j: feat_vec[i, :] for i, j in enumerate(filenames)}
                 self._save_dump(dump_path, i, encoding_map)
+        self.logger.info("End: Image encoding generation")
         return None
 
     def _get_cnn_features_batch(
@@ -295,11 +296,11 @@ class CNN:
 
     def encode_images(
         self,
-        image_dir: Union[PurePath, str],
+        image_dir: Union[Path, str],
         recursive: Optional[bool] = False,
         num_enc_workers: int = 0,
         dump_path: Optional[Path] = None
-    ) -> Dict:
+    ) -> Optional[Dict]:
         """Generate CNN encodings for all images in a given directory of images. Test.
 
         Args:
@@ -382,45 +383,48 @@ class CNN:
 
         results = {}
         dump_files = dump_path.glob(f"{CNN.DUMP_NAME}_*")
-        for i, _file_path_acceptor in enumerate(dump_files):
-            for k, _file_path_donor in enumerate(dump_files):
-                if k <= i:
+        files_list = list(dump_files)
+        image_ids = []
+        features = []
+        for i, _file_path_acceptor in enumerate(files_list):
+            for k, _file_path_donor in enumerate(files_list):
+                if k <= i and len(files_list) > 1:
                     continue
                 encoding_map: Dict[str, list] = self._load_dump(dump_path, i)
-                encoding_map_donor: Dict[str, list] = self._load_dump(dump_path, k)
-                encoding_map.update(encoding_map_donor)
-                print(encoding_map)
+                if k <= i:
+                    encoding_map_donor: Dict[str, list] = self._load_dump(dump_path, k)
+                    encoding_map.update(encoding_map_donor)
 
                 # get all image ids
                 # we rely on dictionaries preserving insertion order in Python >=3.6
-                image_ids = np.array([*encoding_map.keys()])
+                image_ids += encoding_map.keys()
 
                 # put image encodings into feature matrix
-                features = np.array([*encoding_map.values()])
+                features += encoding_map.values()
 
-                self.logger.info("Start: Calculating cosine similarities...")
+        self.logger.info("Start: Calculating cosine similarities...")
+        # TODO: we need to do something with features and image_ids
+        self.cosine_scores = get_cosine_similarity(
+            np.array(features), bool(self.verbose), num_workers=num_sim_workers
+        )
 
-                self.cosine_scores = get_cosine_similarity(
-                    features, bool(self.verbose), num_workers=num_sim_workers
-                )
+        np.fill_diagonal(
+            self.cosine_scores, 2.0
+        )  # allows to filter diagonal in results, 2 is a placeholder value
 
-                np.fill_diagonal(
-                    self.cosine_scores, 2.0
-                )  # allows to filter diagonal in results, 2 is a placeholder value
+        self.logger.info("End: Calculating cosine similarities.")
 
-                self.logger.info("End: Calculating cosine similarities.")
+        for i, j in enumerate(self.cosine_scores):
+            duplicates_bool = (j >= min_similarity_threshold) & (j < 2)
 
-                for i, j in enumerate(self.cosine_scores):
-                    duplicates_bool = (j >= min_similarity_threshold) & (j < 2)
+            if scores:
+                tmp = np.array([*zip(np.array(image_ids), j)], dtype=object)
+                duplicates = list(map(tuple, tmp[duplicates_bool]))
 
-                    if scores:
-                        tmp = np.array([*zip(image_ids, j)], dtype=object)
-                        duplicates = list(map(tuple, tmp[duplicates_bool]))
-
-                    else:
-                        duplicates = list(image_ids[duplicates_bool])
-
-                    results[image_ids[i]] = duplicates
+            else:
+                duplicates = list(np.array(image_ids)[duplicates_bool])
+            # These is some bug, when small amount encode_map => small amount clusters
+            results[image_ids[i]] = list(set(duplicates))
 
         if outfile and scores:
             save_json(results=results, filename=outfile, float_scores=True)

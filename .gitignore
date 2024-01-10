@@ -253,3 +253,4 @@ mkdocs/docs/index.md
 *.cpp
 
 main.py
+encoding_map
